@@ -1,0 +1,2 @@
+# No third-party packages are required: the agent uses only the Python standard library
+# and talks to the local Ollama server over its REST API (http://127.0.0.1:11434).

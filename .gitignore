@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+# run artifacts
+output.json
+*.tmp
+logs/*
+!logs/sample_public_run.jsonl
+dev/out_*.json
+dev/test.py
+# packaging
+*.zip

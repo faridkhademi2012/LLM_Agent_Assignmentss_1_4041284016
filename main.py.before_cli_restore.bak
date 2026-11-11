@@ -1,0 +1,126 @@
+"""Entry point.   python main.py --input input.json --output output.json
+
+Input : one object {"id": ..., "problem": ...}, a list of such objects, or JSON-Lines.
+Output: same shape, with {"id": ..., "answer": "..."} (answer = final answer only).
+All inference runs on the LOCAL Ollama server; no cloud API is used.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+from agent.llm import LLMError, OllamaClient
+from agent.logger import RunLogger
+from agent.solver import Agent
+
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "qwen3.8:27b")   # evaluation model announced for the course
+
+
+def read_input(path):
+    with open(path, "r", encoding="utf-8-sig") as f:
+        text = f.read()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = [json.loads(l) for l in text.splitlines() if l.strip()]     # JSON Lines
+    single = isinstance(data, dict) and not any(k in data for k in ("problems", "data", "items", "questions"))
+    if isinstance(data, dict) and not single:
+        data = next(data[k] for k in ("problems", "data", "items", "questions") if k in data)
+    items = [data] if single else list(data)
+    probs = []
+    for i, it in enumerate(items):
+        if isinstance(it, str):
+            it = {"id": f"item_{i + 1}", "problem": it}
+        pid = it.get("id", f"item_{i + 1}")
+        text = next((it[k] for k in ("problem", "question", "text", "prompt", "input") if k in it), "")
+        probs.append((pid, str(text)))
+    return probs, single
+
+
+def write_output(path, results, single):
+    obj = results[0] if single and results else results
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)          # atomic: output.json is always valid JSON
+
+
+def main():
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    ap = argparse.ArgumentParser(description="Local Ollama reasoning agent")
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name (env AGENT_MODEL)")
+    ap.add_argument("--host", default=None, help="Ollama host (env OLLAMA_HOST, default 127.0.0.1:11434)")
+    ap.add_argument("--budget", type=float, default=float(os.environ.get("AGENT_BUDGET", 300)),
+                    help="time budget per problem in seconds")
+    ap.add_argument("--max-calls", type=int, default=int(os.environ.get("AGENT_MAX_CALLS", 8)),
+                    help="max LLM calls per problem")
+    ap.add_argument("--no-think", action="store_true", help="disable the model's thinking mode entirely")
+    ap.add_argument("--pot-think", action="store_true", help="also use thinking when writing code (slower)")
+    ap.add_argument("--num-ctx", type=int, default=int(os.environ.get("AGENT_NUM_CTX", 8192)),
+                    help="context window; lower it (e.g. 4096) if RAM/VRAM is small")
+    ap.add_argument("--ids", default=None, help="comma-separated ids to solve (debugging)")
+    ap.add_argument("--resume", action="store_true", help="keep non-empty answers already in --output")
+    ap.add_argument("--log-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    log = RunLogger(args.log_dir, verbose=not args.quiet)
+    probs, single = read_input(args.input)
+    if args.ids:
+        keep = {x.strip() for x in args.ids.split(",")}
+        probs = [p for p in probs if str(p[0]) in keep]
+    results = [{"id": pid, "answer": ""} for pid, _ in probs]
+    done = {}
+    if args.resume and os.path.exists(args.output):
+        try:
+            with open(args.output, encoding="utf-8") as f:
+                old = json.load(f)
+            done = {str(r["id"]): r.get("answer", "") for r in (old if isinstance(old, list) else [old])}
+        except Exception:
+            done = {}
+        for r in results:
+            r["answer"] = done.get(str(r["id"]), "") or ""
+    write_output(args.output, results, single)          # valid file even if we are interrupted
+
+    llm = OllamaClient(args.model, host=args.host, logger=log)
+    try:
+        model = llm.resolve_model()
+    except LLMError as e:
+        log.warn(f"cannot reach Ollama / model: {e}")
+        return 1
+    log.info(f"model={model}  problems={len(probs)}  budget={args.budget}s  max_calls={args.max_calls}")
+    try:                                   # load the model before any problem's clock starts
+        secs = llm.warmup()
+        speed = f"{llm.tok_s:.1f} tok/s" if llm.tok_s else "unknown speed"
+        mode = "slow hardware: thinking only when time allows" if (llm.tok_s or 99) < 15 else "normal"
+        log.info(f"model loaded in {secs:.0f}s, {speed} ({mode})")
+    except LLMError as e:
+        log.warn(f"warm-up failed ({e}); continuing")
+
+    agent = Agent(llm, log, budget_s=args.budget, max_calls=args.max_calls, think=not args.no_think,
+                  pot_think=args.pot_think, num_ctx=args.num_ctx)
+    t0 = time.time()
+    for i, (pid, problem) in enumerate(probs):
+        if results[i]["answer"]:
+            log.info(f"[{pid}] already answered (resume): {results[i]['answer']!r}")
+            continue
+        try:
+            results[i]["answer"] = agent.solve(pid, problem) or ""
+        except Exception as e:                           # never crash the whole run
+            log.warn(f"[{pid}] unexpected error: {type(e).__name__}: {e}")
+        write_output(args.output, results, single)
+    log.info(f"done: {len(probs)} problems, {llm.calls} LLM calls, {time.time() - t0:.0f}s total")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
